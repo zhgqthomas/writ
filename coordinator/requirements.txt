@@ -32,7 +32,7 @@ python-jose[cryptography]>=3.4.0  # CVE-2024-33664 (JWT bomb), CVE-2024-33663 (a
 # tokens" — features whose modules (security/entitlements.py, scheduler/apns.py)
 # do not exist in this build. Nothing imported it, so it was a dependency that
 # could only ever contribute CVE surface to the runtime image. Removed.
-cryptography>=43.0.3  # multiple CVEs fixed since 41.0.7 (e.g. CVE-2024-26130); >=43.0.3 required by webauthn 2.5.0
+cryptography>=50.0.0  # CVE-2026-69247 / PYSEC-2026-3552 fixed in 50.0.0; do not lower this safety floor
 passlib>=1.7.4
 alembic>=1.13.1
 beautifulsoup4>=4.12.3

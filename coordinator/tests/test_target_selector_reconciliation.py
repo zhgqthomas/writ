@@ -180,7 +180,19 @@ async def test_ignore_regex_only_patch_mirrors_to_row(db_session):
 
 
 @pytest.mark.asyncio
-async def test_url_edit_clears_every_row_baseline(db_session):
+async def test_url_edit_clears_every_row_baseline(db_session, monkeypatch):
+    import socket
+
+    # This checks database invalidation, not the machine's DNS configuration.
+    # Keep the real URL/SSRF validator; supply only a deterministic public DNS
+    # answer so offline CI and local DNS proxies cannot change the outcome.
+    def resolve_example(host, port):
+        assert host == "example.com"
+        assert port is None
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                 ("93.184.216.34", 0))]
+
+    monkeypatch.setattr("security.validation.socket.getaddrinfo", resolve_example)
     target = await _content_target(db_session)
     await _minted_row(db_session, target)
     await _minted_row(db_session, target, selector="#stock", name="Stock")

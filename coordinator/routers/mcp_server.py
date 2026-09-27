@@ -70,8 +70,8 @@ SERVER_VERSION = "1.0.0"
 # through writ_run_workflow. 0 disables derived tools entirely.
 MCP_DERIVED_TOOL_CAP = max(0, int(os.getenv("MCP_DERIVED_TOOL_CAP", "20")))
 
-# Terminal run statuses (RunItem.status normalization, routers/runs.py).
-_TERMINAL = {"success", "failed", "cancelled", "skipped"}
+# Terminal task statuses from /api/automation/tasks/{id}/results.
+_TERMINAL = {"success", "failed", "timeout", "cancelled", "skipped"}
 
 # ── JSON-RPC helpers (MCP is JSON-RPC 2.0) ───────────────────────────────────
 
@@ -559,32 +559,24 @@ async def _run_workflow_id(token: str, wf: dict, inputs: dict, wait: bool, timeo
         json_body=body,
     )
     task_id = (disp or {}).get("task_id") if isinstance(disp, dict) else None
+    if not task_id:
+        return {"workflow_id": wid, "name": wf.get("name"), "status": "failed",
+                "error": "The run endpoint returned no task_id; cannot track this dispatch."}
     if not wait:
         return {"workflow_id": wid, "name": wf.get("name"), "task_id": task_id,
                 "status": "dispatched",
                 "note": "Read results later with writ_workflow_data."}
 
-    # Poll the unified runs feed for THIS workflow's newest run since dispatch.
+    # Track the dispatched task itself. A workflow-wide feed can still contain
+    # the previous successful run before this task starts, or a concurrent run.
     deadline = dispatch_ts + max(5, min(timeout_s, 600))
-    run_row_id: Optional[int] = None
     status = "running"
     error = None
     while time.time() < deadline:
-        feed = await _call("GET", "/api/runs", token,
-                           params={"run_type": "workflow", "entity_id": wid, "limit": 5})
-        newest = None
-        for r in (feed or []):
-            st = (r.get("started_at") or "")
-            # RunItem.id is "workflow-<row id>"; keep the newest run at/after dispatch.
-            if newest is None or st > (newest.get("started_at") or ""):
-                newest = r
-        if newest:
-            try:
-                run_row_id = int(str(newest["id"]).split("-")[-1])
-            except (ValueError, KeyError):
-                run_row_id = None
-            status = newest.get("status") or "running"
-            error = newest.get("error")
+        task = await _call("GET", f"/api/automation/tasks/{task_id}/results", token)
+        if isinstance(task, dict) and task.get("task_id") == task_id:
+            status = task.get("status") or "running"
+            error = task.get("error")
             if status in _TERMINAL:
                 break
         await _sleep(2.0)
@@ -592,10 +584,10 @@ async def _run_workflow_id(token: str, wf: dict, inputs: dict, wait: bool, timeo
     result: dict = {"workflow_id": wid, "name": wf.get("name"), "task_id": task_id, "status": status}
     if error:
         result["error"] = error
-    if status == "success" and run_row_id is not None:
+    if status == "success":
         try:
             data = await _call("GET", f"/api/automation/workflows/{wid}/data", token,
-                               params={"run_id": run_row_id, "view": "run", "limit": 200})
+                               params={"run_id": task_id, "view": "run", "limit": 200})
             result["columns"] = (data or {}).get("columns")
             result["rows"] = (data or {}).get("rows")
         except _Upstream:

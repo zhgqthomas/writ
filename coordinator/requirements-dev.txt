@@ -4,10 +4,11 @@
 # .github/workflows/ci.yml. Kept SEPARATE from requirements.txt so the
 # production Docker images stay lean and a CVE in a linter never lands in prod.
 #
-# Runtime deps (fastapi, sqlalchemy, …) live in requirements.txt — install
-# BOTH in CI when a job needs the app importable (mypy/bandit import-follow)
-# or runs the test suite. Versions are pinned for reproducible CI runs;
-# bump deliberately.
+# When a job imports the app or runs tests, install requirements.lock with
+# --require-hashes first, then capture `python -m pip freeze` into a temporary
+# constraints file. Install this file with `--constraint <runtime-constraints>`
+# and run `python -m pip check`, so tools cannot replace production dependencies.
+# Keep tool version changes deliberate; runtime packages stay pinned by the lock.
 
 # Test harness (moved out of requirements.txt so the runtime image ships
 # without pytest).
@@ -24,6 +25,6 @@ mypy==1.11.2
 # Security static analysis (AST-based). Fails the build on MEDIUM+ findings.
 bandit==1.7.10
 
-# Dependency CVE auditing against requirements.txt. Honoured ignore-list lives
+# Dependency CVE auditing against requirements.lock. Honoured ignore-list lives
 # in pip-audit-ignore.txt (one GHSA/CVE id per line, with an inline rationale).
 pip-audit==2.7.3

@@ -931,7 +931,8 @@ async def agent_bootstrap_script(request: Request):
 
     base = (settings.writ_public_url or "").strip().rstrip("/") or str(request.base_url).rstrip("/")
     repo = (os.getenv("WRIT_AGENT_REPO") or "usewrit/writ-agent").strip().strip("/")
-    script = agent_installer.render(base, repo)
+    tag = (os.getenv("WRIT_AGENT_TAG") or "").strip()
+    script = agent_installer.render(base, repo, tag)
     return PlainTextResponse(
         script,
         media_type="text/x-shellscript",

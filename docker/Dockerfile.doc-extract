@@ -27,8 +27,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY doc-extract/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# The Python 3.12 lock includes hashes for Linux amd64 and arm64 wheels.
+COPY doc-extract/requirements.txt doc-extract/requirements.lock ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 COPY doc-extract/ ./
 

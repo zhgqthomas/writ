@@ -32,6 +32,7 @@
 #   scripts/release-e2e.sh                    # full run, tears down after
 #   scripts/release-e2e.sh --keep             # leave the stack up to poke at
 #   scripts/release-e2e.sh --agent-repo o/r   # test against a fork's release
+#   scripts/release-e2e.sh --agent-tag v1.2.3 # pin an exact published release
 #
 # Exit code is the gate: 0 = the promise holds.
 # =============================================================================
@@ -66,6 +67,7 @@ BASE="http://localhost:${HOST_PORT}"
 FIXTURE_URL="${FIXTURE_URL:-https://example.com/}"
 FIXTURE_MATCH="${FIXTURE_MATCH:-Example Domain}"
 AGENT_REPO="${WRIT_AGENT_REPO:-usewrit/writ-agent}"
+AGENT_TAG="${WRIT_AGENT_TAG:-}"
 # The agent gets its OWN data home, for two independent reasons.
 #
 # 1. A single WRIT_HOME is exclusively locked by one live process. On a machine
@@ -77,7 +79,6 @@ AGENT_REPO="${WRIT_AGENT_REPO:-usewrit/writ-agent}"
 #    home it would print "using the agent already at …" and skip the download
 #    entirely — so the stage whose entire purpose is to exercise the published
 #    release assets and their checksums would silently test a cached file.
-AGENT_HOME="${AGENT_HOME:-${TMPDIR:-/tmp}/writ-release-gate-home}"
 OWNER_EMAIL="release-gate@localhost"
 OWNER_PASS="ReleaseGate!2026x"
 KEEP=0
@@ -86,10 +87,26 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --keep)        KEEP=1; shift;;
     --agent-repo)  AGENT_REPO="${2:?}"; shift 2;;
+    --agent-tag)   AGENT_TAG="${2:?}"; shift 2;;
     -h|--help)     sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
+
+RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/writ-release-e2e.XXXXXX")"
+RUN_ID="$(basename "$RUN_DIR" | tr '[:upper:].' '[:lower:]-')"
+PROJECT="$RUN_ID"
+AGENT_HOME="${AGENT_HOME:-$RUN_DIR/agent}"
+LOG_DIR="${WRIT_E2E_LOG_DIR:-${TMPDIR:-/tmp}/writ-release-e2e-logs/$RUN_ID}"
+mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR"
+AGENT_LOG="$LOG_DIR/installer.log"
+COMPOSE=(docker compose --project-name "$PROJECT" --env-file "$RUN_DIR/compose.env"
+  -f "$ROOT/docker/docker-compose.yml" -f "$RUN_DIR/compose.override.json")
+COMPOSE_STARTED=0
+ENV_TOUCHED=0
+AGENT_HOME_OWNED=0
+helper() { python3 "$SCRIPT_DIR/release_e2e.py" "$@"; }
 
 STAGE=0
 stage() { STAGE=$((STAGE + 1)); printf '\n\033[1;34m[%d/9]\033[0m \033[1m%s\033[0m\n' "$STAGE" "$*"; }
@@ -128,6 +145,18 @@ print(d if not isinstance(d, (dict, list)) else json.dumps(d))
 # reason and the real defect gets misdiagnosed as flakiness.
 cleanup() {
   local rc=$?
+  trap - EXIT INT TERM
+  # Collect before removing containers or the agent home. Even a failed build
+  # has its complete output in compose-build.log.
+  if [ "$COMPOSE_STARTED" -eq 1 ]; then
+    "${COMPOSE[@]}" ps -a >"$LOG_DIR/compose-ps.log" 2>&1 || true
+    "${COMPOSE[@]}" logs --no-color --timestamps >"$LOG_DIR/compose.log" 2>&1 || true
+  fi
+  if [ "$AGENT_HOME_OWNED" -eq 1 ] && [ -f "$AGENT_HOME/agent.log" ]; then
+    cp "$AGENT_HOME/agent.log" "$LOG_DIR/agent.log" || true
+  fi
+  printf 'exit_code=%s\nagent_repo=%s\nagent_tag=%s\nproject=%s\n' \
+    "$rc" "$AGENT_REPO" "$AGENT_TAG" "$PROJECT" >"$LOG_DIR/run.txt" || true
   # Put the operator's .env back. This script has to rewrite the URL and ports to
   # configure the stack, but that file is theirs — leaving it pointing at a
   # throwaway port would break the next plain `docker compose up` they run, and
@@ -137,24 +166,40 @@ cleanup() {
   # one failing step used to abandon the rest — a failed .env restore left the
   # stack, the agent and the fixture all running, and the next run then failed in
   # preflight for a reason unrelated to whatever it was testing.
+  if [ "$KEEP" -eq 0 ]; then
+    if [ "$AGENT_HOME_OWNED" -eq 1 ]; then
+      if [ -f "$AGENT_HOME/agent.pid" ]; then
+        local agent_pid
+        agent_pid="$(cat "$AGENT_HOME/agent.pid" 2>/dev/null)" || agent_pid=""
+        case "$agent_pid" in ''|*[!0-9]*) ;; *) kill "$agent_pid" 2>/dev/null || true;; esac
+      fi
+      rm -rf "$AGENT_HOME" || true
+    fi
+    if [ "$COMPOSE_STARTED" -eq 1 ]; then
+      "${COMPOSE[@]}" down -v >"$LOG_DIR/compose-down.log" 2>&1 || true
+    fi
+  fi
   if [ -n "${ENV_BACKUP:-}" ] && [ -f "$ENV_BACKUP" ]; then
     mv -f "$ENV_BACKUP" "$ROOT/.env" 2>/dev/null \
       || printf '\033[1;33m[warn]\033[0m could not restore .env — your copy is at %s\n' "$ENV_BACKUP"
+  elif [ "$ENV_TOUCHED" -eq 1 ]; then
+    rm -f "$ROOT/.env" || true
   fi
-  [ -n "${FIXTURE_PID:-}" ] && kill "$FIXTURE_PID" 2>/dev/null || true
-  # Match on the gate's OWN home, never on the binary name: `pkill -f
-  # writ-agent` would also kill the operator's desktop daemon, a fleet worker
-  # they are running deliberately, and this script's own command line.
-  pkill -f "$AGENT_HOME/writ-agent-fleet" 2>/dev/null || true
-  [ "$KEEP" -eq 1 ] || rm -rf "$AGENT_HOME"
   if [ "$KEEP" -eq 1 ]; then
-    printf '\n\033[1;33m[keep]\033[0m stack left running at %s (docker compose down to stop)\n' "$BASE"
+    printf '\n[keep] stack at %s; stop it with: ' "$BASE"
+    printf '%q ' "${COMPOSE[@]}" down -v
+    printf '\n'
+    printf '[keep] agent home: %s; compose files: %s\n' "$AGENT_HOME" "$RUN_DIR"
   else
-    ( cd "$ROOT" && docker compose down -v >/dev/null 2>&1 ) || true
+    # Preserve a failed .env restore's backup for manual recovery.
+    [ -f "${ENV_BACKUP:-/nonexistent}" ] || rm -rf "$RUN_DIR" || true
   fi
+  printf '\nDiagnostics: %s\n' "$LOG_DIR"
   exit $rc
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # =============================================================================
 stage "Preflight"
@@ -166,13 +211,21 @@ docker info >/dev/null 2>&1 || die "Docker is not running."
 docker compose version >/dev/null 2>&1 || die "This needs Docker Compose v2 (docker compose, not docker-compose)."
 ok "docker, curl, python3"
 
-# The gate is worthless if it silently tests a stale image or a previous run's
-# database — a workflow left over from last time would make stage 8 pass with no
-# agent involved at all.
-( cd "$ROOT" && docker compose down -v >/dev/null 2>&1 ) || true
-pkill -f "$AGENT_HOME/writ-agent-fleet" 2>/dev/null || true
-rm -rf "$AGENT_HOME"
-ok "no leftover stack or agent from a previous run"
+# Never stop the operator's existing stack or delete a supplied agent home.
+# A unique project gives every run fresh containers, network and data volumes.
+[ ! -e "$AGENT_HOME" ] || die "AGENT_HOME already exists: $AGENT_HOME. Choose a new empty path."
+mkdir -p "$AGENT_HOME"
+AGENT_HOME_OWNED=1
+ok "isolated compose project $PROJECT and fresh agent home"
+
+helper validate-release "$AGENT_REPO" "$AGENT_TAG"
+if [ -z "$AGENT_TAG" ]; then
+  info "resolving $AGENT_REPO latest release once for this run"
+  curl -fsSL --max-time 30 "https://api.github.com/repos/$AGENT_REPO/releases/latest" \
+    >"$LOG_DIR/agent-release.json"
+  AGENT_TAG="$(helper release-tag <"$LOG_DIR/agent-release.json")"
+fi
+ok "agent release pinned to $AGENT_REPO@$AGENT_TAG"
 
 # Check the ports BEFORE the build. Compose reports a clash only after several
 # minutes of image work, as "failed programming external connectivity", which
@@ -199,35 +252,42 @@ ok "ports $HOST_PORT and $DOC_PORT are free"
 stage "Bring the stack up (docker compose up --build)"
 # =============================================================================
 cd "$ROOT"
-[ -f .env ] || { ./scripts/gen-env.sh >/dev/null 2>&1 || die "gen-env.sh failed"; }
-ENV_BACKUP="$(mktemp)"
-cp .env "$ENV_BACKUP"
+if [ -f .env ]; then
+  ENV_BACKUP="$RUN_DIR/original.env"
+  cp -p .env "$ENV_BACKUP"
+fi
+ENV_TOUCHED=1
+[ -f .env ] || { ./scripts/gen-env.sh >"$LOG_DIR/gen-env.log" 2>&1 || die "gen-env.sh failed"; }
 
 # The agent runs on the HOST and dials this URL back. It must be the published
 # port, not the container-internal one — an agent handed http://coordinator:8000
 # resolves nothing outside the compose network and reports no error the operator
 # can see, it simply never appears in the fleet.
-python3 - "$BASE" "$HOST_PORT" "$DOC_PORT" <<'PY'
-import pathlib, re, sys
-base, host_port, doc_port = sys.argv[1:4]
-p = pathlib.Path(".env"); s = p.read_text()
-for key, val in (("WRIT_PUBLIC_URL", base),
-                 ("WRIT_HOST_PORT", host_port),
-                 ("WRIT_DOC_EXTRACT_HOST_PORT", doc_port)):
-    line = f"{key}={val}"
-    s, n = re.subn(rf"^{key}=.*$", line, s, flags=re.M)
-    if not n:
-        s = s.rstrip("\n") + "\n" + line + "\n"
-p.write_text(s)
+helper configure-env .env "$BASE" "$HOST_PORT" "$DOC_PORT" "$AGENT_REPO" "$AGENT_TAG"
+cp .env "$RUN_DIR/compose.env"
+# Keep image tags isolated too: building this gate must not replace a local
+# operator's writ-coordinator:latest. Explicit environment pins also defeat
+# stale variables inherited from the caller's shell.
+python3 - "$RUN_DIR/compose.override.json" "$PROJECT" "$AGENT_REPO" "$AGENT_TAG" "$BASE" "$DOC_PORT" <<'PY'
+import json, pathlib, sys
+path, project, repo, tag, base, doc_port = sys.argv[1:]
+pathlib.Path(path).write_text(json.dumps({"services": {
+    "coordinator": {"image": project + "-coordinator", "environment": {
+        "WRIT_AGENT_REPO": repo, "WRIT_AGENT_TAG": tag, "WRIT_PUBLIC_URL": base,
+        "DOC_EXTRACT_URL": "http://127.0.0.1:" + doc_port}},
+    "doc-extract": {"image": project + "-doc-extract"}}}))
 PY
+export WRIT_HOST_PORT="$HOST_PORT" WRIT_DOC_EXTRACT_HOST_PORT="$DOC_PORT"
 ok "WRIT_PUBLIC_URL=$BASE, host ports $HOST_PORT/$DOC_PORT"
 
 info "building images (first run pulls the Playwright base — several minutes)"
-docker compose up -d --build >/dev/null 2>&1 || die "docker compose up failed. Run it by hand to see the build output."
+COMPOSE_STARTED=1
+"${COMPOSE[@]}" --progress plain up -d --build coordinator doc-extract >"$LOG_DIR/compose-build.log" 2>&1 \
+  || { tail -80 "$LOG_DIR/compose-build.log"; die "docker compose up failed (full output: $LOG_DIR/compose-build.log)."; }
 
 for i in $(seq 1 90); do
   if curl -fsS --max-time 3 "$BASE/health" >/dev/null 2>&1; then break; fi
-  [ "$i" = 90 ] && { docker compose logs --tail 40 coordinator; die "coordinator never became healthy."; }
+  [ "$i" = 90 ] && { "${COMPOSE[@]}" logs --tail 40 coordinator; die "coordinator never became healthy."; }
   sleep 2
 done
 HEALTH="$(curl -fsS "$BASE/health")"
@@ -300,10 +360,10 @@ CODE="$(printf '%s' "$PAIR" | jget code)"
 [ -n "$CODE" ] || die "no pairing code minted: $PAIR"
 ok "pairing code $CODE"
 
-info "running the printed installer against $AGENT_REPO's published release"
-AGENT_LOG="$(mktemp)"
-if ! env WRIT_AGENT_REPO="$AGENT_REPO" WRIT_HOME="$AGENT_HOME" \
-      sh -c "curl -fsSL '$BASE/agent.sh' | sh -s -- '$CODE'" >"$AGENT_LOG" 2>&1; then
+info "running the rendered installer against $AGENT_REPO@$AGENT_TAG"
+curl -fsSL "$BASE/agent.sh" -o "$LOG_DIR/agent.sh" 2>"$AGENT_LOG"
+if ! env WRIT_HOME="$AGENT_HOME" WRIT_FORCE_DOWNLOAD=1 \
+      sh "$LOG_DIR/agent.sh" "$CODE" >>"$AGENT_LOG" 2>&1; then
   sed 's/^/    /' "$AGENT_LOG"
   die "the published install one-liner failed. This is what a new user runs first."
 fi
@@ -417,10 +477,10 @@ stage "Replay it over REST"
 RUN="$(curl -fsS --max-time 200 -X POST "$BASE/api/automation/workflows/$WFID/run?wait=true&timeout=150" \
   -H "authorization: Bearer $APIKEY" -H 'content-type: application/json' -d '{}')"
 RSTATUS="$(printf '%s' "$RUN" | jget status)"
-case "$RSTATUS" in
-  success|succeeded|completed|complete|ok) ok "REST replay ran to completion (status=$RSTATUS)";;
-  *) die "REST replay did not succeed (status=${RSTATUS:-<none>}): $RUN";;
-esac
+printf '%s\n' "$RUN" >"$LOG_DIR/rest-run.json"
+REST_TASK_ID="$(printf '%s' "$RUN" | helper validate-run)" \
+  || die "REST replay did not succeed (status=${RSTATUS:-<none>}): $RUN"
+ok "REST replay ran to completion (task=$REST_TASK_ID)"
 
 # =============================================================================
 stage "Call it over MCP"
@@ -428,15 +488,11 @@ stage "Call it over MCP"
 # Same workflow, second protocol. These are separate code paths to the same
 # executor, and they have drifted before — the MCP side once saved workflows
 # with is_active=False, which made them invisible to exactly this call.
-MRUN="$(mcp writ_run_workflow "{\"workflow_id\":$WFID,\"wait\":true}")"
-# An MCP tool failure comes back as a 200 with `isError: true` and the message in
-# the SAME content block, so matching on hopeful words like "running" would pass
-# on "Error: workflow not running". Check the flag.
-[ "$(printf '%s' "$MRUN" | jget result.isError)" = "True" ] \
-  && die "MCP run of the same workflow returned an error: $MRUN"
-printf '%s' "$MRUN" | grep -qiE "success|complete|finished|$FIXTURE_MATCH" \
-  || die "MCP run did not report a completed run: $MRUN"
-ok "MCP replay of workflow #$WFID ran to completion"
+MRUN="$(mcp writ_run_workflow "{\"workflow_id\":$WFID,\"wait\":true,\"max_age\":0}")"
+printf '%s\n' "$MRUN" >"$LOG_DIR/mcp-run.json"
+MCP_TASK_ID="$(printf '%s' "$MRUN" | helper validate-run --mcp --previous-task "$REST_TASK_ID" --workflow-id "$WFID")" \
+  || die "MCP run did not complete a fresh successful task: $MRUN"
+ok "MCP replay of workflow #$WFID ran to completion (task=$MCP_TASK_ID)"
 
 LIST="$(mcp writ_list_workflows '{}')"
 printf '%s' "$LIST" | grep -q 'release-gate-probe' \
@@ -445,4 +501,4 @@ ok "workflow is visible and callable over MCP"
 
 # =============================================================================
 printf '\n\033[1;32m═══ RELEASE GATE PASSED ═══\033[0m\n'
-printf 'compose up → owner → released agent from %s → record → replay → REST → MCP\n\n' "$AGENT_REPO"
+printf 'compose up → owner → released agent %s@%s → record → replay → REST → MCP\n\n' "$AGENT_REPO" "$AGENT_TAG"

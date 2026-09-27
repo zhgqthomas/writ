@@ -129,10 +129,25 @@ def test_script_configures_the_agent_by_environment():
     assert "WRIT_FLEET_ALLOW_INSECURE" in src
 
 
-def test_script_redeems_before_downloading():
+def test_script_redeems_before_downloading(tmp_path, monkeypatch):
     """A bad code should fail in a second, not after tens of megabytes."""
-    src = _script()
-    assert src.index("pair-code/exchange") < src.index("releases/latest")
+    import os
+    import subprocess
+    from services import agent_installer
+
+    curl = tmp_path / "curl"
+    calls = tmp_path / "calls"
+    curl.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\nexit 22\n')
+    curl.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("CALLS", str(calls))
+    result = subprocess.run(["sh", "-s", "--", "WRIT-EXPIRED"], text=True,
+                            input=agent_installer.render("https://writ.example.com", "owner/writ-agent"),
+                            capture_output=True)
+    assert result.returncode != 0
+    requests = calls.read_text().splitlines()
+    assert len(requests) == 1
+    assert "https://writ.example.com/api/fleet/pair-code/exchange" in requests[0]
 
 
 def test_script_is_posix_sh():
@@ -158,12 +173,10 @@ def test_script_placeholders_are_substituted_not_literal():
     """The template markers must never reach a user's shell."""
     import os
 
-    import main
+    from services import agent_installer
 
     base = "https://writ.example.com"
-    rendered = main._AGENT_BOOTSTRAP.replace("@@BASE@@", base).replace(
-        "@@REPO@@", os.getenv("WRIT_AGENT_REPO") or "usewrit/writ-agent"
-    )
+    rendered = agent_installer.render(base, os.getenv("WRIT_AGENT_REPO") or "usewrit/writ-agent")
     assert "@@" not in rendered
     assert base in rendered
 

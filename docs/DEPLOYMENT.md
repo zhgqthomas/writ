@@ -41,15 +41,18 @@ Re-run it any time: to change domain, to repair a half-finished deploy, or after
 
 The [Docker images workflow](../.github/workflows/docker.yml) builds the
 coordinator (including its web UI) and doc-extract on native amd64 and arm64
-runners. Each image is started and checked before publishing: coordinator must
+runners. Publication first runs the complete CI and cross-repository E2E gate
+against the exact tagged commit. Each image is started and checked: coordinator must
 serve a healthy API and its built UI; doc-extract must report a ready OCR engine.
-All four builds must pass before either image receives multi-platform tags.
+All checks and all four builds must pass before the publishing job receives
+registry write permissions and loads the saved, tested images. A candidate
+manifest is verified before assigning version or stable tags.
 
 | Trigger | Result |
 | --- | --- |
 | Relevant changes in a PR or on `main` | Build and smoke-test both images on both architectures; no registry push |
-| Push a `v*` tag | Build, smoke-test, and publish both images to GHCR |
-| Actions → Docker images → Run workflow | Build and smoke-test; select **publish** to also push images |
+| Push a `vMAJOR.MINOR.PATCH[-prerelease]` tag | Validate CI/E2E, build, smoke-test, and publish both images to GHCR |
+| Actions → Docker images → Run workflow | Build and smoke-test; select **publish** and an existing version **tag** to run all publication gates |
 
 Published image names follow the repository owner, lowercased, so a fork publishes
 to its own namespace:
@@ -57,12 +60,24 @@ to its own namespace:
 - `ghcr.io/<owner>/writ-coordinator`
 - `ghcr.io/<owner>/writ-doc-extract`
 
-A `v1.2.3` tag publishes `:v1.2.3`, `:latest`, and `:sha-<full commit SHA>`.
-Prerelease tags such as `v1.2.3-rc.1` do not update `:latest`. A manual publish
-from a branch uses the branch name (for example `:main`) and the SHA tag, without
-updating `:latest`. Both images contain `linux/amd64` and `linux/arm64` in the
+A `v1.2.3` tag publishes `:v1.2.3`, `:1.2.3`, and `:sha-<full commit SHA>`.
+Only the highest stable version tag can advance `:latest`; the existing manifest's
+version annotation also prevents a rollback if a newer Git tag was deleted.
+Prerelease tags such as `v1.2.3-rc.1` never update `:latest`. A legacy `latest`
+without a version annotation is preserved, with a note in the Actions summary;
+confirm its version and migrate its annotation before enabling automatic promotion.
+Moved or deleted release tags fail validation again immediately before publication.
+Manual publication requires a version tag; an untagged branch can only be built.
+Both images contain `linux/amd64` and `linux/arm64` in the
 same manifest, so Docker selects the host's architecture automatically. The
 Actions summary lists the exact published references.
+
+The E2E gate uses `agent_repo` (default: this owner's `writ-agent`) and optional
+`agent_tag`. An empty tag resolves the latest stable Agent release once, records
+that exact version, and pins it for the whole test. A new fork must publish its
+Agent first, or explicitly select an existing compatible Agent release. Failed
+build, Compose, installer and Agent logs are saved before cleanup and uploaded
+as an artifact; local runs use an isolated Compose project and temporary Agent home.
 
 Publishing uses the repository's `GITHUB_TOKEN` with `packages: write`; no extra
 registry secret is needed. For anonymous pulls, make each GHCR package public
@@ -77,6 +92,14 @@ To smoke-test a locally built image with the same checks as CI:
 bash scripts/smoke-docker-image.sh writ-coordinator:latest coordinator
 bash scripts/smoke-docker-image.sh writ-doc-extract:latest doc-extract
 ```
+
+The CI test/audit environment uses the same hashed Python lockfiles as the images.
+`scripts/install-ci-deps.sh` installs runtime dependencies first, then constrains
+test tools to that installed set so they cannot silently replace production pins.
+After editing either Python requirements input, regenerate its lock for Python 3.12
+with `uv pip compile --generate-hashes --only-binary=:all:` and verify both Linux
+amd64 and arm64 resolutions before committing. The coordinator frontend builds
+with Node 24, matching `frontend/package.json`.
 
 ## TLS
 

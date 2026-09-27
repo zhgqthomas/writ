@@ -14,6 +14,16 @@ updates:
         update-types: [minor, patch]
     labels: [dependencies, python]
 
+  - package-ecosystem: pip
+    directory: /doc-extract
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-and-patch:
+        update-types: [minor, patch]
+    labels: [dependencies, python]
+
   - package-ecosystem: npm
     directory: /frontend
     schedule:
@@ -37,13 +47,19 @@ updates:
       interval: weekly
     labels: [dependencies, ci]
 
-  # The Dockerfile pins both base images by DIGEST (node:20-slim,
+  # The Dockerfile pins both base images by DIGEST (node:24-slim,
   # python:3.12-slim), so builds are reproducible and a re-pushed tag cannot
   # change what ships. Dependabot understands digest pins and opens a PR with the
   # new digest when the upstream tag moves — which is the point: the bump becomes
   # a reviewable change instead of something that happens silently on next build.
   - package-ecosystem: docker
     directory: /docker
+    schedule:
+      interval: weekly
+    labels: [dependencies, docker]
+
+  - package-ecosystem: docker
+    directory: /doc-extract
     schedule:
       interval: weekly
     labels: [dependencies, docker]

@@ -37,8 +37,10 @@ import logging
 import os
 import platform
 import re
+import shlex
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,7 @@ set -eu
 
 COORDINATOR="@@BASE@@"
 REPO="@@REPO@@"
+RELEASE_API=@@RELEASE_API@@
 CODE="${1:-}"
 
 # --- Download-only mode ------------------------------------------------------
@@ -120,7 +123,7 @@ if [ -x "$BIN" ] && [ "${WRIT_FORCE_DOWNLOAD:-0}" != "1" ]; then
   say "Using the agent already at $BIN"
 else
   say "Finding the $TARGET build..."
-  URLS="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+  URLS="$(curl -fsSL "$RELEASE_API" \
     | grep -o "\"browser_download_url\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
     | cut -d'"' -f4)"
   # Every archive has a `.sha256` sibling whose name also contains the infix, so
@@ -211,6 +214,7 @@ DOC_EXTRACT_URL="$DOC_URL" \
 DOC_EXTRACT_SECRET="$DOC_SECRET" \
 WRIT_HOME="$WRIT_DIR" \
 nohup "$BIN" >"$WRIT_DIR/agent.log" 2>&1 &
+echo "$!" >"$WRIT_DIR/agent.pid"
 
 sleep 3
 if kill -0 $! 2>/dev/null; then
@@ -268,14 +272,19 @@ def host_target() -> Optional[str]:
     return PLATFORM_TARGETS.get((platform.system(), platform.machine()))
 
 
-def render(base: str, repo: str) -> str:
+def render(base: str, repo: str, tag: str = "") -> str:
     """The script with its per-deployment placeholders filled in.
 
     ``@@BASE@@`` / ``@@REPO@@`` are substituted per request rather than baked in,
     so a rotated coordinator URL or a forked agent repo takes effect on the very
     next fetch.
     """
-    return AGENT_BOOTSTRAP.replace("@@BASE@@", base).replace("@@REPO@@", repo)
+    # The release gate pins this once at startup. Ordinary installs retain the
+    # latest-release behavior when no deployment pin is configured.
+    release = f"tags/{quote(tag, safe='')}" if tag else "latest"
+    api = f"https://api.github.com/repos/{repo}/releases/{release}"
+    return (AGENT_BOOTSTRAP.replace("@@BASE@@", base).replace("@@REPO@@", repo)
+            .replace("@@RELEASE_API@@", shlex.quote(api)))
 
 
 class InstallerError(RuntimeError):
