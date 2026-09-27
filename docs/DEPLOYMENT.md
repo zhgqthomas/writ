@@ -37,6 +37,47 @@ script does the rest and tells you what it changed.
 Re-run it any time: to change domain, to repair a half-finished deploy, or after
 `docker compose down`.
 
+## Container images
+
+The [Docker images workflow](../.github/workflows/docker.yml) builds the
+coordinator (including its web UI) and doc-extract on native amd64 and arm64
+runners. Each image is started and checked before publishing: coordinator must
+serve a healthy API and its built UI; doc-extract must report a ready OCR engine.
+All four builds must pass before either image receives multi-platform tags.
+
+| Trigger | Result |
+| --- | --- |
+| Relevant changes in a PR or on `main` | Build and smoke-test both images on both architectures; no registry push |
+| Push a `v*` tag | Build, smoke-test, and publish both images to GHCR |
+| Actions → Docker images → Run workflow | Build and smoke-test; select **publish** to also push images |
+
+Published image names follow the repository owner, lowercased, so a fork publishes
+to its own namespace:
+
+- `ghcr.io/<owner>/writ-coordinator`
+- `ghcr.io/<owner>/writ-doc-extract`
+
+A `v1.2.3` tag publishes `:v1.2.3`, `:latest`, and `:sha-<full commit SHA>`.
+Prerelease tags such as `v1.2.3-rc.1` do not update `:latest`. A manual publish
+from a branch uses the branch name (for example `:main`) and the SHA tag, without
+updating `:latest`. Both images contain `linux/amd64` and `linux/arm64` in the
+same manifest, so Docker selects the host's architecture automatically. The
+Actions summary lists the exact published references.
+
+Publishing uses the repository's `GITHUB_TOKEN` with `packages: write`; no extra
+registry secret is needed. For anonymous pulls, make each GHCR package public
+after its first publication. Existing packages must grant this repository Actions
+access. The checked-in Compose configuration and `deploy.sh` continue to build
+from source; using published images requires setting the corresponding service
+`image` references and running Compose with `--no-build`.
+
+To smoke-test a locally built image with the same checks as CI:
+
+```bash
+bash scripts/smoke-docker-image.sh writ-coordinator:latest coordinator
+bash scripts/smoke-docker-image.sh writ-doc-extract:latest doc-extract
+```
+
 ## TLS
 
 Caddy obtains the certificate over ACME and **renews it by itself**. There is no

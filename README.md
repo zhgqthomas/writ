@@ -74,6 +74,10 @@ Open **http://localhost:8000** and create your account.
 > First build takes a few minutes — the OCR runtime and its model weights are
 > baked in so document extraction works offline.
 
+The [Docker images workflow](.github/workflows/docker.yml) also builds both
+services for `linux/amd64` and `linux/arm64`, and publishes version-tagged images
+to the repository owner's GHCR namespace. See [image publishing and tags](docs/DEPLOYMENT.md#container-images).
+
 ### 2. Connect one agent
 
 The coordinator runs no browsers itself, so **nothing will execute until one

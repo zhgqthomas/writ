@@ -20,7 +20,9 @@
 # deployment. The digest below is the multi-arch INDEX digest, so amd64/arm64
 # both still resolve. Dependabot bumps it (see .github/dependabot.yml).
 #   node:20-slim as of 2026-04-22
-FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS ui-build
+# Vite emits architecture-independent HTML/CSS/JS. Keep this stage native when
+# cross-building; only the Python runtime needs the requested target platform.
+FROM --platform=$BUILDPLATFORM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS ui-build
 
 WORKDIR /build
 

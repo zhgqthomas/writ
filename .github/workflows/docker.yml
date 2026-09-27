@@ -1,0 +1,205 @@
+name: Docker images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - .github/workflows/docker.yml
+      - .dockerignore
+      - docker/**
+      - coordinator/**
+      - frontend/**
+      - doc-extract/**
+      - scripts/smoke-docker-image.sh
+  pull_request:
+    paths:
+      - .github/workflows/docker.yml
+      - .dockerignore
+      - docker/**
+      - coordinator/**
+      - frontend/**
+      - doc-extract/**
+      - scripts/smoke-docker-image.sh
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Push images to GHCR after all builds and smoke tests pass
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Only superseded PR checks share a group. Publication has its own queue below,
+# so a main-branch check can never replace a pending version release.
+concurrency:
+  group: docker-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PUBLISH: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+
+jobs:
+  build:
+    name: ${{ matrix.image }} (${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [coordinator, doc-extract]
+        # Native runners avoid emulating the OCR stack and frontend build.
+        platform:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image name
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          COMPONENT: ${{ matrix.image }}
+        run: echo "name=ghcr.io/${OWNER,,}/writ-${COMPONENT}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and load the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.${{ matrix.image }}
+          platforms: linux/${{ matrix.platform.arch }}
+          load: true
+          tags: writ-${{ matrix.image }}:ci
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=writ-${{ matrix.image }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=writ-${{ matrix.image }}-${{ matrix.platform.arch }}
+
+      - name: Smoke test the runtime image
+        env:
+          COMPONENT: ${{ matrix.image }}
+        run: bash scripts/smoke-docker-image.sh "writ-${COMPONENT}:ci" "$COMPONENT"
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Reuse this runner's BuildKit cache after the smoke test. Push only a
+      # digest here; public tags are assigned after ALL four builds pass.
+      - name: Push the tested image by digest
+        if: env.PUBLISH == 'true'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.${{ matrix.image }}
+          platforms: linux/${{ matrix.platform.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/$ARCH"
+
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH == 'true'
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish ${{ matrix.image }} (amd64 + arm64)
+    needs: build
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: docker-publish-${{ matrix.image }}
+      # Retain pending releases (the default single-slot queue replaces them).
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [coordinator, doc-extract]
+    steps:
+      - name: Resolve image name
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          COMPONENT: ${{ matrix.image }}
+        run: echo "name=ghcr.io/${OWNER,,}/writ-${COMPONENT}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: Generate image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=long
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+
+      - name: Publish and verify both architectures
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for arch in amd64 arm64; do
+            digest=$(cat "$RUNNER_TEMP/digests/$arch")
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            sources+=("$IMAGE@$digest")
+          done
+          tags=()
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] && tags+=(--tag "$tag")
+          done <<< "$TAGS"
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          ref="${TAGS%%$'\n'*}"
+          docker buildx imagetools inspect "$ref" --raw \
+            | jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | unique | sort == ["amd64", "arm64"]'
+          printf '### %s\n\nPlatforms: `linux/amd64`, `linux/arm64`\n\n' "$IMAGE" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r tag; do
+            printf -- '- `%s`\n' "$tag" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$TAGS"
